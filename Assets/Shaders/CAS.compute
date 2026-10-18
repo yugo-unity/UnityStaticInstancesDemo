@@ -1,0 +1,196 @@
+// AMD FidelityFX CAS as a compute shader.
+// Same algorithm and constants as CAS.shader; AMD's semi-persistent 16x16 layout: one {64,1,1} group
+// handles four 8x8 tiles, with ARmp8x8 giving a PS-like swizzle inside each tile.
+// The HQ upscale kernel evaluates each input pixel's 3x3 window once per group in groupshared memory
+// instead of once per output corner (see CasUpscaleLds below). LQ keeps the reference layout: its window math is
+// cheap, and the groupshared pass costs more than it saves.
+#pragma kernel CasSharpen    CAS_NO_SCALING=1 CAS_LOW_QUALITY=0
+#pragma kernel CasSharpenLQ  CAS_NO_SCALING=1 CAS_LOW_QUALITY=1
+#pragma kernel CasUpscale    CAS_NO_SCALING=0 CAS_LOW_QUALITY=0
+#pragma kernel CasUpscaleLQ  CAS_NO_SCALING=0 CAS_LOW_QUALITY=1
+
+#define A_GPU 1
+#define A_HLSL 1
+#include "Packages/com.unity.render-pipelines.core/Runtime/PostProcessing/Shaders/ffx/ffx_a.hlsl"
+
+Texture2D<float4>   _CasInput;
+RWTexture2D<float4> _CasOutput;
+float4 _CasConst0;
+float4 _CasConst1;
+float4 _CasInputSize;   // xy = input size, zw = 1 / input size
+float4 _CasOutputSize;  // xy = output size
+
+AF3 CasLoad(ASU2 p)
+{
+    p = clamp(p, ASU2(0, 0), ASU2(_CasInputSize.xy) - ASU2(1, 1));
+    return _CasInput.Load(int3(p, 0)).rgb;
+}
+void CasInput(inout AF1 r, inout AF1 g, inout AF1 b) {}
+
+#include "Packages/com.unity.render-pipelines.core/Runtime/PostProcessing/Shaders/ffx/ffx_cas.hlsl"
+
+void CasPixel(AU2 gxy, const bool noScaling, const bool lowQuality)
+{
+    if (any(gxy >= AU2(_CasOutputSize.xy)))
+        return;
+
+    AF4 c;
+    CasFilter(c.r, c.g, c.b, gxy, asuint(_CasConst0), asuint(_CasConst1), noScaling, lowQuality);
+
+    ASU2 center = noScaling ? ASU2(gxy) : ASU2(AF2(gxy) * _CasConst0.xy + _CasConst0.zw + AF2(0.5, 0.5));
+    center = clamp(center, ASU2(0, 0), ASU2(_CasInputSize.xy) - ASU2(1, 1));
+    c.a = _CasInput.Load(int3(center, 0)).a;
+
+    _CasOutput[gxy] = c;
+}
+
+#define CAS_KERNEL_BODY(NOSCALING, LOWQ) \
+    AU2 gxy = ARmp8x8(localId) + AU2(groupId.x << 4u, groupId.y << 4u); \
+    CasPixel(gxy, NOSCALING, LOWQ); \
+    gxy.x += 8u; CasPixel(gxy, NOSCALING, LOWQ); \
+    gxy.y += 8u; CasPixel(gxy, NOSCALING, LOWQ); \
+    gxy.x -= 8u; CasPixel(gxy, NOSCALING, LOWQ);
+
+[numthreads(64, 1, 1)]
+void CasSharpen(uint localId : SV_GroupIndex, uint3 groupId : SV_GroupID)
+{
+    CAS_KERNEL_BODY(true, false)
+}
+
+[numthreads(64, 1, 1)]
+void CasSharpenLQ(uint localId : SV_GroupIndex, uint3 groupId : SV_GroupID)
+{
+    CAS_KERNEL_BODY(true, true)
+}
+
+[numthreads(64, 1, 1)]
+void CasUpscaleLQ(uint localId : SV_GroupIndex, uint3 groupId : SV_GroupID)
+{
+    CAS_KERNEL_BODY(false, true)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// HQ upscale with groupshared windows.
+//
+// ffx_cas.hlsl's upscale blends the sharpened results of the 4 input pixels around the sample point (F, G, J, K).
+// Expanding its final weights gives, per channel,
+//   out = sat( sum_c s_c * N_c / sum_c s_c * D_c ),  c in {F, G, J, K}
+//   N_c = center_c + w_c * (up + left + right + down),  D_c = 1 + 4 * w_c
+//   s_c = bilinear_c * rcp(1/8 + |green_c - thinA| * rcpMaxGreen_c),  thinA = average green of the 4
+// where w_c comes from the 3x3 soft min/max around c, per channel. N, D, green and rcpMaxGreen depend only on
+// the input pixel, so phase A computes them once per input pixel of the group's footprint, and phase B combines 4 of
+// them per output pixel. Same approximations as ffx_cas.hlsl (APrxLoRcp / APrxLoSqrt / APrxMedRcp); only the float
+// evaluation order differs. Alpha comes from the nearest input pixel, as in CasPixel.
+// ---------------------------------------------------------------------------------------------------------------
+
+// input pixels per side for 16 output pixels at scale <= 1: (last - first) <= ceil(15 * scale) <= 15, plus the K corner
+#define CAS_LDS_DIM 17
+groupshared AF4 gsNumGreen[CAS_LDS_DIM * CAS_LDS_DIM]; // rgb = N, a = center green
+groupshared AF4 gsDenRcpM[CAS_LDS_DIM * CAS_LDS_DIM];  // rgb = D, a = rcp of the green soft max
+groupshared AF1 gsAlpha[CAS_LDS_DIM * CAS_LDS_DIM];
+
+AF3 CasPrxLoRcpF3(AF3 a) { return AF3(APrxLoRcpF1(a.r), APrxLoRcpF1(a.g), APrxLoRcpF1(a.b)); }
+AF3 CasPrxLoSqrtF3(AF3 a) { return AF3(APrxLoSqrtF1(a.r), APrxLoSqrtF1(a.g), APrxLoSqrtF1(a.b)); }
+AF3 CasPrxMedRcpF3(AF3 a) { return AF3(APrxMedRcpF1(a.r), APrxMedRcpF1(a.g), APrxMedRcpF1(a.b)); }
+
+ASU2 CasLdsBase(AU2 outputPos)
+{
+    return ASU2(floor(AF2(outputPos) * _CasConst0.xy + _CasConst0.zw));
+}
+
+void CasLdsStore(ASU2 p, uint index)
+{
+    //  ul u ur
+    //  l  c r
+    //  dl d dr
+    AF3 ul = CasLoad(p + ASU2(-1, -1));
+    AF3 u  = CasLoad(p + ASU2( 0, -1));
+    AF3 ur = CasLoad(p + ASU2( 1, -1));
+    AF3 l  = CasLoad(p + ASU2(-1,  0));
+    AF3 r  = CasLoad(p + ASU2( 1,  0));
+    AF3 dl = CasLoad(p + ASU2(-1,  1));
+    AF3 d  = CasLoad(p + ASU2( 0,  1));
+    AF3 dr = CasLoad(p + ASU2( 1,  1));
+    AF4 c4 = _CasInput.Load(int3(clamp(p, ASU2(0, 0), ASU2(_CasInputSize.xy) - ASU2(1, 1)), 0));
+    AF3 c = c4.rgb;
+
+    // soft min and max (2x, as in ffx_cas.hlsl): cross + full 3x3
+    AF3 mn = AMin3F3(AMin3F3(u, l, c), r, d);
+    AF3 mn2 = AMin3F3(AMin3F3(mn, ul, ur), dl, dr);
+    AF3 mx = AMax3F3(AMax3F3(u, l, c), r, d);
+    AF3 mx2 = AMax3F3(AMax3F3(mx, ul, ur), dl, dr);
+    mn += mn2;
+    mx += mx2;
+    AF3 rcpM = CasPrxLoRcpF3(mx);
+    AF3 amp = CasPrxLoSqrtF3(ASatF3(min(mn, AF3_(2.0) - mx) * rcpM));
+    AF3 w = amp * _CasConst1.x; // peak
+
+    gsNumGreen[index] = AF4(c + w * (u + l + r + d), c.g);
+    gsDenRcpM[index] = AF4(AF3_(1.0) + AF3_(4.0) * w, rcpM.g);
+    gsAlpha[index] = c4.a;
+}
+
+void CasLdsPixel(AU2 gxy, ASU2 base)
+{
+    if (any(gxy >= AU2(_CasOutputSize.xy)))
+        return;
+
+    AF2 pp = AF2(gxy) * _CasConst0.xy + _CasConst0.zw;
+    AF2 fp = floor(pp);
+    pp -= fp;
+    ASU2 lp = ASU2(fp) - base;
+    uint iF = (uint)lp.y * CAS_LDS_DIM + (uint)lp.x;
+    uint iG = iF + 1u;
+    uint iJ = iF + CAS_LDS_DIM;
+    uint iK = iJ + 1u;
+
+    AF4 nF = gsNumGreen[iF], nG = gsNumGreen[iG], nJ = gsNumGreen[iJ], nK = gsNumGreen[iK];
+    AF4 dF = gsDenRcpM[iF], dG = gsDenRcpM[iG], dJ = gsDenRcpM[iJ], dK = gsDenRcpM[iK];
+
+    // bilinear weights, thinned to hide the bilinear interpolation (helps diagonals)
+    AF1 s = (AF1_(1.0) - pp.x) * (AF1_(1.0) - pp.y);
+    AF1 t = pp.x * (AF1_(1.0) - pp.y);
+    AF1 u = (AF1_(1.0) - pp.x) * pp.y;
+    AF1 v = pp.x * pp.y;
+    AF1 thinA = nF.a * 0.25 + nG.a * 0.25 + nJ.a * 0.25 + nK.a * 0.25;
+    AF1 thinB = 1.0 / 8.0;
+    s *= APrxLoRcpF1(thinB + abs(nF.a - thinA) * dF.a);
+    t *= APrxLoRcpF1(thinB + abs(nG.a - thinA) * dG.a);
+    u *= APrxLoRcpF1(thinB + abs(nJ.a - thinA) * dJ.a);
+    v *= APrxLoRcpF1(thinB + abs(nK.a - thinA) * dK.a);
+
+    AF3 num = nF.rgb * s + nG.rgb * t + nJ.rgb * u + nK.rgb * v;
+    AF3 den = dF.rgb * s + dG.rgb * t + dJ.rgb * u + dK.rgb * v;
+    AF4 c;
+    c.rgb = ASatF3(num * CasPrxMedRcpF3(den));
+
+    // alpha from the nearest input pixel (one of the 4 corners)
+    uint nearest = (pp.y < 0.5 ? iF : iJ) + (pp.x < 0.5 ? 0u : 1u);
+    c.a = gsAlpha[nearest];
+
+    _CasOutput[gxy] = c;
+}
+
+[numthreads(64, 1, 1)]
+void CasUpscale(uint localId : SV_GroupIndex, uint3 groupId : SV_GroupID)
+{
+    // phase A: the group's input footprint, one window per input pixel
+    AU2 origin = AU2(groupId.x << 4u, groupId.y << 4u);
+    ASU2 base = CasLdsBase(origin);
+    ASU2 extent = min(CasLdsBase(origin + AU2(15u, 15u)) - base + ASU2(2, 2), ASU2(CAS_LDS_DIM, CAS_LDS_DIM));
+    uint count = (uint)(extent.x * extent.y);
+    for (uint i = localId; i < count; i += 64u)
+    {
+        uint y = i / (uint)extent.x;
+        uint x = i - y * (uint)extent.x;
+        CasLdsStore(base + ASU2(x, y), y * CAS_LDS_DIM + x);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // phase B: same 16x16 layout as CAS_KERNEL_BODY
+    AU2 gxy = ARmp8x8(localId) + origin;
+    CasLdsPixel(gxy, base);
+    gxy.x += 8u; CasLdsPixel(gxy, base);
+    gxy.y += 8u; CasLdsPixel(gxy, base);
+    gxy.x -= 8u; CasLdsPixel(gxy, base);
+}
